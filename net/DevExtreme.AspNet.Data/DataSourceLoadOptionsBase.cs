@@ -119,6 +119,18 @@ namespace DevExtreme.AspNet.Data {
 
         public bool AllowAsyncOverSync { get; set; }
 
+        /// <summary>
+        /// A raw SQL query string to be used as the base query.
+        /// When specified, the query will start from this SQL instead of a LINQ queryable source.
+        /// This requires Entity Framework Core and a DbSet&lt;T&gt; source.
+        /// </summary>
+        public string FromSqlRaw { get; set; }
+
+        /// <summary>
+        /// Parameters for the raw SQL query specified in <see cref="FromSqlRaw"/>.
+        /// </summary>
+        public object[] FromSqlParameters { get; set; }
+
 #if DEBUG
         internal Action<Expression> ExpressionWatcher;
         internal bool UseEnumerableOnce;
