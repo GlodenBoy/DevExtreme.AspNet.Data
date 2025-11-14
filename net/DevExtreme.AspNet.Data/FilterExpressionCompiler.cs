@@ -20,11 +20,15 @@ namespace DevExtreme.AspNet.Data {
         bool _stringToLower;
 
         readonly bool _supportsEqualsMethod;
+        readonly IReadOnlyList<GroupingInfo> _groupingInfo;
+        readonly IEnumerable<SortingInfo> _sortInfo;
 
-        public FilterExpressionCompiler(Type itemType, bool guardNulls, bool stringToLower = false, bool supportsEqualsMethod = true)
+        public FilterExpressionCompiler(Type itemType, bool guardNulls, bool stringToLower = false, bool supportsEqualsMethod = true, IReadOnlyList<GroupingInfo> groupingInfo = null, IEnumerable<SortingInfo> sortInfo = null)
             : base(itemType, guardNulls) {
             _stringToLower = stringToLower;
             _supportsEqualsMethod = supportsEqualsMethod;
+            _groupingInfo = groupingInfo;
+            _sortInfo = sortInfo;
         }
 
         public LambdaExpression Compile(IList criteriaJson) {
@@ -49,6 +53,46 @@ namespace DevExtreme.AspNet.Data {
             var clientAccessor = Convert.ToString(criteriaJson[0]);
             var clientOperation = hasExplicitOperation ? Convert.ToString(criteriaJson[1]).ToLower() : "=";
             var clientValue = Utils.UnwrapNewtonsoftValue(criteriaJson[hasExplicitOperation ? 2 : 1]);
+
+            // 检查是否是分组字段或排序字段（用于精确匹配）
+            bool isGroupingOrSortField = false;
+
+            // 检查字段是否是字符串类型的分组字段或排序字段
+            try {
+                var property = ItemType.GetProperty(clientAccessor,
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.IgnoreCase);
+                if(property != null) {
+                    var propertyType = property.PropertyType;
+                    // 处理可空类型
+                    if(propertyType.IsGenericType && propertyType.GetGenericTypeDefinition() == typeof(Nullable<>)) {
+                        propertyType = propertyType.GetGenericArguments()[0];
+                    }
+                    // 如果是字符串类型，检查是否是分组字段或排序字段
+                    if(propertyType == typeof(string)) {
+                        // 检查是否是分组字段
+                        bool isGroupingField = _groupingInfo != null && _groupingInfo.Any(g =>
+                            g.Selector.Equals(clientAccessor, StringComparison.OrdinalIgnoreCase));
+
+                        // 检查是否是排序字段
+                        bool isSortField = _sortInfo != null && _sortInfo.Any(s =>
+                            s.Selector.Equals(clientAccessor, StringComparison.OrdinalIgnoreCase));
+
+                        // 如果是分组字段或排序字段
+                        if(isGroupingField || isSortField) {
+                            isGroupingOrSortField = true;
+                            // 如果操作符是 "="，自动转换为 "contains"（因为逗号分隔的字符串需要使用精确匹配）
+                            if(clientOperation == "=") {
+                                clientOperation = CONTAINS;
+                            }
+                        }
+                    }
+                }
+            } catch {
+                // 忽略错误
+            }
+
             var isStringOperation = clientOperation == CONTAINS || clientOperation == NOT_CONTAINS || clientOperation == STARTS_WITH || clientOperation == ENDS_WITH;
 
             if(CustomFilterCompilers.Binary.CompilerFuncs.Count > 0) {
@@ -73,6 +117,13 @@ namespace DevExtreme.AspNet.Data {
             });
 
             if(isStringOperation) {
+                // 如果是分组字段或排序字段的 contains 操作，使用精确匹配（避免"张三"匹配到"张三丰"）
+                if(isGroupingOrSortField && clientOperation == CONTAINS) {
+                    return CompileExactStringMatch(accessorExpr, Convert.ToString(clientValue), false);
+                }
+                if(isGroupingOrSortField && clientOperation == NOT_CONTAINS) {
+                    return CompileExactStringMatch(accessorExpr, Convert.ToString(clientValue), true);
+                }
                 return CompileStringFunction(accessorExpr, clientOperation, Convert.ToString(clientValue));
 
             } else {
@@ -213,6 +264,64 @@ namespace DevExtreme.AspNet.Data {
                     result
                 );
             }
+
+            return result;
+        }
+
+        /// <summary>
+        /// 编译精确字符串匹配表达式（用于逗号分隔的字符串字段）
+        /// 匹配规则：
+        /// 1. field == value （完全相等，可使用索引，性能最好）
+        /// 2. field.StartsWith(value + ",") （开头匹配，可使用索引，性能较好）
+        /// 3. field.Contains("," + value + ",") （中间匹配，无法使用索引，性能较差）
+        /// 4. field.EndsWith("," + value) （结尾匹配，无法使用索引，性能较差）
+        /// 这样可以避免"张三"匹配到"张三丰"的问题
+        ///
+        /// 性能说明：
+        /// - 前两个条件（== 和 StartsWith）可以使用索引，性能较好
+        /// - 后两个条件（Contains 和 EndsWith）需要全表扫描，性能较差
+        /// - 数据库优化器通常会先执行可以使用索引的条件，如果找到匹配就不执行后面的条件
+        /// - 建议在字段上创建索引以提升性能：CREATE INDEX idx_field ON table(field)
+        /// </summary>
+        Expression CompileExactStringMatch(Expression accessorExpr, string value, bool invert) {
+            if(_stringToLower && value != null)
+                value = value.ToLower();
+
+            if(GuardNulls)
+                accessorExpr = Expression.Coalesce(accessorExpr, Expression.Constant(""));
+
+            // 构建四个匹配条件（按性能从好到差排序，让数据库优化器优先执行可以使用索引的条件）
+            var stringType = typeof(string);
+            var valueConst = Expression.Constant(value, stringType);
+            var valueCommaConst = Expression.Constant(value + ",", stringType);
+            var commaValueConst = Expression.Constant("," + value, stringType);
+            var commaValueCommaConst = Expression.Constant("," + value + ",", stringType);
+
+            // 1. field == value （完全相等，可使用索引，性能最好）
+            var equalsExpr = Expression.Equal(accessorExpr, valueConst);
+
+            // 2. field.StartsWith(value + ",") （开头匹配，可使用索引，性能较好）
+            var startsWithMethod = stringType.GetMethod(nameof(string.StartsWith), new[] { stringType });
+            var startsWithExpr = Expression.Call(accessorExpr, startsWithMethod, valueCommaConst);
+
+            // 3. field.Contains("," + value + ",") （中间匹配，无法使用索引，性能较差）
+            var containsMethod = stringType.GetMethod(nameof(string.Contains), new[] { stringType });
+            var containsExpr = Expression.Call(accessorExpr, containsMethod, commaValueCommaConst);
+
+            // 4. field.EndsWith("," + value) （结尾匹配，无法使用索引，性能较差）
+            var endsWithMethod = stringType.GetMethod(nameof(string.EndsWith), new[] { stringType });
+            var endsWithExpr = Expression.Call(accessorExpr, endsWithMethod, commaValueConst);
+
+            // 组合四个条件：OR 连接
+            // 注意：将可以使用索引的条件放在前面，数据库优化器可能会优先执行这些条件
+            // 如果前面的条件已经找到匹配，可能不会执行后面的全表扫描条件
+            Expression result = Expression.OrElse(equalsExpr, startsWithExpr);
+            result = Expression.OrElse(result, containsExpr);
+            result = Expression.OrElse(result, endsWithExpr);
+
+            // 如果需要取反（NOT_CONTAINS）
+            if(invert)
+                result = Expression.Not(result);
 
             return result;
         }

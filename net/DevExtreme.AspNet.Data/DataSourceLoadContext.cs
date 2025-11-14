@@ -106,8 +106,34 @@ namespace DevExtreme.AspNet.Data {
                     return summary != null && summary.Any(i => i.SummaryType == "avg");
                 }
 
+                bool HasStringGrouping() {
+                    // 检查是否有字符串类型的分组字段（需要分割操作，无法在数据库端执行）
+                    if(HasGroups && Group != null) {
+                        var firstGroup = Group.FirstOrDefault();
+                        if(firstGroup != null && String.IsNullOrEmpty(firstGroup.GroupInterval)) {
+                            try {
+                                // 检查字段类型是否为字符串
+                                var property = _itemType.GetProperty(firstGroup.Selector, System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.IgnoreCase);
+                                if(property != null) {
+                                    var propertyType = Utils.StripNullableType(property.PropertyType);
+                                    if(propertyType == typeof(string)) {
+                                        return true; // 发现字符串类型分组字段，需要禁用远程分组
+                                    }
+                                }
+                            } catch {
+                                // 如果无法访问字段，忽略
+                            }
+                        }
+                    }
+                    return false;
+                }
+
                 bool ShouldUseRemoteGrouping() {
                     if(_providerInfo.IsLinqToObjects)
+                        return false;
+
+                    // 如果有字符串类型的分组字段，禁用远程分组（因为字符串分割无法在数据库端执行）
+                    if(HasStringGrouping())
                         return false;
 
                     if(_providerInfo.IsEFCore) {
